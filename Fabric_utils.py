@@ -1,10 +1,19 @@
-"""Shared helpers: synthetic fabric generation + image preprocessing."""
+"""Shared helpers for real fabric dataset loading and preprocessing."""
 
+import os
+import random
 import numpy as np
 import cv2
 
-IMG_SIZE = 128
-CLASSES = ["Normal", "Hole", "Stain", "Wrinkle", "Oil Spot"]
+IMG_SIZE = 96
+CLASSES = ["Good", "Hole", "Objects", "Oil Spot", "Thread Error"]
+FOLDER_TO_CLASS = {
+    "good": "Good",
+    "hole": "Hole",
+    "objects": "Objects",
+    "thread error": "Thread Error",
+    "oil spot": "Oil Spot",
+}
 
 
 def make_fabric_base(size=IMG_SIZE, seed=None):
@@ -43,12 +52,9 @@ def add_stain(img, rng):
 def add_wrinkle(image):
     img = image.copy()
     h, w = img.shape[:2]
-    # Random line coordinates
     x1, y1 = np.random.randint(0, w), np.random.randint(0, h)
     x2, y2 = np.random.randint(0, w), np.random.randint(0, h)
-    # Draw a dark line to simulate fold/shadow
-    cv2.line(img, (x1, y1), (x2, y2), (40, 40, 40), thickness=np.random.randint(2, 5))
-    # Apply blur to smooth shadow edges
+    cv2.line(img, (x1, y1), (x2, y2), 40, thickness=np.random.randint(2, 5))
     return cv2.GaussianBlur(img, (5, 5), 0)
 
 
@@ -57,33 +63,49 @@ def add_oil_spot(image):
     h, w = img.shape[:2]
     center = (np.random.randint(20, w - 20), np.random.randint(20, h - 20))
     radius = np.random.randint(15, 35)
-    
-    # Create mask to darken a localized region (simulating oil absorption)
+
     mask = np.ones_like(img, dtype=np.float32)
-    cv2.circle(mask, center, radius, (0.5, 0.5, 0.5), -1)
+    cv2.circle(mask, center, radius, 0.5, -1)
     mask = cv2.GaussianBlur(mask, (21, 21), 0)
-    
+
     img_filtered = (img.astype(np.float32) * mask).astype(np.uint8)
     return img_filtered
 
 
-def generate_sample(class_name=None, seed=None):
-    """Generates one synthetic fabric image. Returns (rgb_image, class_name)."""
-    rng = np.random.default_rng(seed)
+def get_real_dataset_sample(class_name=None, data_dir="dataset"):
+    """Return a random real image and its label from the supplied dataset folders."""
     if class_name is None:
-        class_name = CLASSES[rng.integers(0, len(CLASSES))]
-    img = make_fabric_base(seed=seed)
-    if class_name == "Hole":
-        img = add_hole(img, rng)
-    elif class_name == "Stain":
-        img = add_stain(img, rng)
-    img8 = img.astype(np.uint8)
-    rgb = np.stack([img8] * 3, axis=-1)  # grayscale -> RGB
-    return rgb, class_name
+        class_name = random.choice(CLASSES)
+
+    class_dir = None
+    for folder_name, label in FOLDER_TO_CLASS.items():
+        if label == class_name:
+            class_dir = os.path.join(data_dir, folder_name)
+            break
+
+    if class_dir is None or not os.path.isdir(class_dir):
+        raise FileNotFoundError(f"Dataset folder for class '{class_name}' not found in '{data_dir}'")
+
+    files = [
+        os.path.join(class_dir, fname)
+        for fname in os.listdir(class_dir)
+        if fname.lower().endswith((".jpg", ".jpeg", ".png"))
+    ]
+    if not files:
+        raise FileNotFoundError(f"No image files found in '{class_dir}'")
+
+    path = random.choice(files)
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Could not read image: {path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img, class_name
 
 
 def preprocess_for_model(rgb_img):
-    """Resize + normalize a single RGB image for prediction. Returns (1, H, W, 3)."""
+    """Resize a single RGB image; model layers perform final normalization."""
+    if rgb_img.ndim == 2:
+        rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_GRAY2RGB)
     resized = cv2.resize(rgb_img, (IMG_SIZE, IMG_SIZE))
-    arr = resized.astype("float32") / 255.0
+    arr = resized.astype("float32")
     return np.expand_dims(arr, axis=0)
