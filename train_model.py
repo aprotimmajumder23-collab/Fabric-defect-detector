@@ -11,9 +11,9 @@ import cv2
 import tensorflow as tf
 from fabric_utils import IMG_SIZE, CLASSES, generate_sample
 
-DATA_DIR = "data"           # optional: data/Normal, data/Hole, data/Stain
+DATA_DIR = "data"           # optional: data/Normal, data/Hole, data/Stain, data/Wrinkle, data/Oil Spot
 MODEL_PATH = "fabric_model.h5"
-SAMPLES_PER_CLASS = 150
+SAMPLES_PER_CLASS = 200
 
 
 def load_real_or_synthetic_data():
@@ -48,14 +48,14 @@ def load_real_or_synthetic_data():
 def build_model():
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
-        tf.keras.layers.Conv2D(16, 3, activation="relu"),
-        tf.keras.layers.MaxPooling2D(),
-        tf.keras.layers.Conv2D(32, 3, activation="relu"),
-        tf.keras.layers.MaxPooling2D(),
-        tf.keras.layers.Conv2D(64, 3, activation="relu"),
-        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Conv2D(32, (3, 3), activation="relu"),
+        tf.keras.layers.MaxPooling2D(2, 2),
+        tf.keras.layers.Conv2D(64, (3, 3) activation="relu"),
+        tf.keras.layers.MaxPooling2D(2, 2),
+        tf.keras.layers.Conv2D(128, (3, 3) activation="relu"),
+        tf.keras.layers.MaxPooling2D(2, 2),
         tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(128, activation="relu"),
         tf.keras.layers.Dropout(0.3),
         tf.keras.layers.Dense(len(CLASSES), activation="softmax"),
     ])
@@ -83,7 +83,7 @@ def main():
 
     print("\n🚀 Training started...")
     model.fit(X_train, y_train, validation_data=(X_val, y_val),
-              epochs=8, batch_size=32)
+              epochs=12, batch_size=32)
 
     loss, acc = model.evaluate(X_val, y_val, verbose=0)
     print(f"\n📊 Validation accuracy: {acc:.1%}")
