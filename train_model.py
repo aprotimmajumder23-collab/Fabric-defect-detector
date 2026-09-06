@@ -9,7 +9,7 @@ import os
 import numpy as np
 import cv2
 import tensorflow as tf
-from fabric_utils import IMG_SIZE, CLASSES, generate_sample
+from Fabric_utils import IMG_SIZE, CLASSES, generate_sample
 
 DATA_DIR = "data"           # optional: data/Normal, data/Hole, data/Stain, data/Wrinkle, data/Oil Spot
 MODEL_PATH = "fabric_model.h5"
