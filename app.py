@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 import cv2
 from tensorflow.keras.models import load_model
-from fabric_utils import CLASSES, generate_sample, preprocess_for_model
+from Fabric_utils import CLASSES, generate_sample, preprocess_for_model
 
 MODEL_PATH = "fabric_model.h5"
 
