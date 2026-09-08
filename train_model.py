@@ -1,186 +1,292 @@
-"""
-STEP 1 — Train the fabric defect model
-Run:  python train_model.py
-Uses only real images from the dataset folders.
+"""STEP 1 — Train the fabric defect classifier.
+
+Run:  python train_model.py [--epochs 15 --fine-tune-epochs 6 --max-per-class 4000]
+
+Images are streamed from disk with tf.data, the dataset is split by *source
+image* (so patches from the same photo never leak between train/val/test) and
+the resulting model plus metrics are written to ``fabric_model.keras`` and the
+``artifacts/`` folder.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
-import zipfile
+import time
+
 import numpy as np
-import cv2
 import tensorflow as tf
-from Fabric_utils import IMG_SIZE, CLASSES, get_real_dataset_sample, preprocess_for_model
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, roc_auc_score
 
-DATA_DIRS = ["dataset", "data"]
-ARCHIVE_PATH = "archive.zip"
-MODEL_PATH = "fabric_model.h5"
-MAX_REAL_IMAGES_PER_CLASS = 1000
-TRAIN_EPOCHS = 16
-BATCH_SIZE = 8
-SEED = 42
+from fabric_utils import (
+    ARTIFACTS_DIR,
+    CLASSES,
+    DEFAULT_THRESHOLD,
+    GOOD_INDEX,
+    IMG_SIZE,
+    DatasetIndex,
+    dihedral_variants,
+    grouped_split,
+    index_dataset,
+)
 
-FOLDER_TO_CLASS = {
-    "good": "Good",
-    "hole": "Hole",
-    "objects": "Objects",
-    "thread error": "Thread Error",
-    "oil spot": "Oil Spot",
-}
-
-tf.config.threading.set_intra_op_parallelism_threads(1)
-tf.config.threading.set_inter_op_parallelism_threads(1)
+AUTOTUNE = tf.data.AUTOTUNE
 
 
-def ensure_dataset_ready():
-    """Unzip the bundled archive if the dataset folders are missing."""
-    if any(os.path.isdir(d) and os.listdir(d) for d in DATA_DIRS):
-        return
-
-    if os.path.exists(ARCHIVE_PATH) and zipfile.is_zipfile(ARCHIVE_PATH):
-        print(f"📦 Extracting archive '{ARCHIVE_PATH}' into workspace...")
-        with zipfile.ZipFile(ARCHIVE_PATH, "r") as zf:
-            zf.extractall(".")
-
-
-def load_real_or_synthetic_data():
-    """Load unique real dataset images without creating synthetic duplicates."""
-    ensure_dataset_ready()
-    data_dir = next((d for d in DATA_DIRS if os.path.isdir(d)), "dataset")
-    if not os.path.isdir(data_dir):
-        raise FileNotFoundError(f"Dataset directory '{data_dir}' not found. Please unzip '{ARCHIVE_PATH}' or add the folder.")
-
-    X, y = [], []
-    class_images = {cls: [] for cls in CLASSES}
-    for folder_name, cls in FOLDER_TO_CLASS.items():
-        folder = os.path.join(data_dir, folder_name)
-        if not os.path.isdir(folder):
-            continue
-
-        files = [
-            os.path.join(folder, fname)
-            for fname in os.listdir(folder)
-            if fname.lower().endswith((".jpg", ".jpeg", ".png"))
-        ]
-        rng = np.random.default_rng(SEED + len(y))
-        if len(files) > MAX_REAL_IMAGES_PER_CLASS:
-            files = rng.choice(files, size=MAX_REAL_IMAGES_PER_CLASS, replace=False).tolist()
-
-        for path in files:
-            img = cv2.imread(path, cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-            class_images[cls].append(img)
-
-    for idx, cls in enumerate(CLASSES):
-        images = class_images[cls]
-        if not images:
-            raise ValueError(f"No real images found for class '{cls}' in '{data_dir}'")
-        for img in images:
-            X.append(img)
-            y.append(idx)
-
-    print(f"✅ Using {len(X)} real images from '{data_dir}/' across {len(CLASSES)} classes")
-    return np.array(X), np.array(y)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data-dir", default="dataset")
+    p.add_argument("--model-path", default="fabric_model.keras")
+    p.add_argument("--img-size", type=int, default=IMG_SIZE)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=12, help="epochs with the backbone frozen")
+    p.add_argument("--fine-tune-epochs", type=int, default=10, help="extra epochs with the top of the backbone unfrozen (0 to skip)")
+    p.add_argument("--fine-tune-from", default="block_6_expand", help="backbone layer from which weights are unfrozen")
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--fine-tune-learning-rate", type=float, default=1e-4)
+    p.add_argument("--max-per-class", type=int, default=4000, help="cap on images per class (the Good class has ~23k patches)")
+    p.add_argument("--val-fraction", type=float, default=0.15)
+    p.add_argument("--test-fraction", type=float, default=0.15)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--threads", type=int, default=0, help="limit TensorFlow CPU threads (0 = let TF decide)")
+    return p.parse_args()
 
 
-def build_model():
-    base_model = tf.keras.applications.MobileNetV2(
-        include_top=False,
-        weights="imagenet",
-        input_shape=(IMG_SIZE, IMG_SIZE, 3),
-        pooling="avg",
+# --------------------------------------------------------------------------- #
+# Data pipeline
+# --------------------------------------------------------------------------- #
+def _decode(path: tf.Tensor, label: tf.Tensor, img_size: int):
+    img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+    img = tf.image.resize(img, [img_size, img_size])
+    return tf.cast(img, tf.float32), label
+
+
+def _augment(img: tf.Tensor, label: tf.Tensor):
+    """Fabric texture is orientation-agnostic, so flips and 90° rotations are label-preserving."""
+    img = tf.image.random_flip_left_right(img)
+    img = tf.image.random_flip_up_down(img)
+    img = tf.image.rot90(img, k=tf.random.uniform([], 0, 4, dtype=tf.int32))
+    img = tf.image.random_brightness(img, max_delta=20.0)
+    img = tf.image.random_contrast(img, 0.85, 1.15)
+    return tf.clip_by_value(img, 0.0, 255.0), label
+
+
+def make_dataset(index: DatasetIndex, img_size: int, batch_size: int, training: bool, seed: int) -> tf.data.Dataset:
+    ds = tf.data.Dataset.from_tensor_slices((index.paths, index.labels))
+    if training:
+        ds = ds.shuffle(len(index), seed=seed, reshuffle_each_iteration=True)
+    ds = ds.map(lambda path, label: _decode(path, label, img_size), num_parallel_calls=AUTOTUNE)
+    if training:
+        ds = ds.map(_augment, num_parallel_calls=AUTOTUNE)
+    return ds.batch(batch_size).prefetch(AUTOTUNE)
+
+
+def balanced_class_weights(labels: np.ndarray) -> dict[int, float]:
+    """Square-root-damped inverse-frequency weights: lifts rare defect classes without swamping 'Good'."""
+    counts = np.bincount(labels, minlength=len(CLASSES))
+    total = counts.sum()
+    return {i: float(np.sqrt(total / (len(CLASSES) * c))) if c > 0 else 0.0 for i, c in enumerate(counts)}
+
+
+# --------------------------------------------------------------------------- #
+# Model
+# --------------------------------------------------------------------------- #
+def build_model(img_size: int, seed: int) -> tuple[tf.keras.Model, tf.keras.Model]:
+    backbone = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet", input_shape=(img_size, img_size, 3), pooling="avg")
+    backbone.trainable = False
+    initializer = tf.keras.initializers.GlorotUniform(seed=seed)
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Input(shape=(img_size, img_size, 3)),
+            tf.keras.layers.Rescaling(1.0 / 127.5, offset=-1.0),
+            backbone,
+            tf.keras.layers.Dropout(0.3, seed=seed),
+            tf.keras.layers.Dense(256, activation="relu", kernel_initializer=initializer),
+            tf.keras.layers.Dropout(0.3, seed=seed),
+            tf.keras.layers.Dense(len(CLASSES), activation="softmax", kernel_initializer=initializer),
+        ],
+        name="fabric_defect_detector",
     )
-    base_model.trainable = False
-
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
-        tf.keras.layers.RandomFlip("horizontal", seed=SEED),
-        tf.keras.layers.RandomContrast(0.1, seed=SEED),
-        tf.keras.layers.Rescaling(1.0 / 127.5, offset=-1.0),
-        base_model,
-        tf.keras.layers.Dropout(0.25),
-        tf.keras.layers.Dense(256, activation="relu"),
-        tf.keras.layers.Dropout(0.25),
-        tf.keras.layers.Dense(len(CLASSES), activation="softmax"),
-    ])
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                  loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"])
-    return model
+    return model, backbone
 
 
-def main():
-    X, y = load_real_or_synthetic_data()
-    X = X.astype("float32")
-    y = np.array(y)
+def compile_model(model: tf.keras.Model, learning_rate: float) -> None:
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
 
-    # Split each class independently so validation contains real, unseen images.
-    rng = np.random.default_rng(SEED)
-    train_indices, val_indices = [], []
-    for class_id in range(len(CLASSES)):
-        indices = np.flatnonzero(y == class_id)
-        rng.shuffle(indices)
-        split = max(1, int(len(indices) * 0.8))
-        train_indices.extend(indices[:split])
-        val_indices.extend(indices[split:])
 
-    rng.shuffle(train_indices)
-    rng.shuffle(val_indices)
-    X_train, X_val = X[train_indices], X[val_indices]
-    y_train, y_val = y[train_indices], y[val_indices]
+def unfreeze_top(backbone: tf.keras.Model, from_layer: str) -> int:
+    """Unfreeze layers from ``from_layer`` onwards, keeping BatchNorm statistics frozen."""
+    backbone.trainable = True
+    names = [layer.name for layer in backbone.layers]
+    start = names.index(from_layer) if from_layer in names else 0
+    trainable = 0
+    for i, layer in enumerate(backbone.layers):
+        if i < start or isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = False
+        else:
+            trainable += 1
+    return trainable
 
-    class_counts = np.bincount(y_train, minlength=len(CLASSES))
-    class_weights = {
-        i: float(np.sqrt(len(y_train) / (len(CLASSES) * count)))
-        for i, count in enumerate(class_counts)
-        if count > 0
-    }
-    print(f"✅ Train/validation split: {len(X_train)}/{len(X_val)} real images")
-    print("   Training class counts:", dict(zip(CLASSES, class_counts.tolist())))
 
-    model = build_model()
-    model.summary()
-
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_accuracy", patience=5, mode="max", restore_best_weights=True
-        ),
-        tf.keras.callbacks.ModelCheckpoint(
-            MODEL_PATH, monitor="val_accuracy", mode="max", save_best_only=True
-        ),
+def callbacks_for(model_path: str, patience: int, best_so_far: float | None = None) -> list:
+    return [
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6),
+        tf.keras.callbacks.ModelCheckpoint(model_path, monitor="val_loss", save_best_only=True, initial_value_threshold=best_so_far),
     ]
 
-    print("\n🚀 Training started...")
-    model.fit(X_train, y_train, validation_data=(X_val, y_val),
-              epochs=TRAIN_EPOCHS, batch_size=BATCH_SIZE,
-              class_weight=class_weights, callbacks=callbacks)
 
-    # Keep the best frozen-backbone checkpoint for reliable CPU inference.
-    # Full MobileNet fine-tuning is too memory-intensive for this environment.
-    model = tf.keras.models.load_model(MODEL_PATH)
-    loss, acc = model.evaluate(X_val, y_val, verbose=0)
-    print(f"\n📊 Validation accuracy: {acc:.1%}")
+# --------------------------------------------------------------------------- #
+# Evaluation helpers (shared with evaluate_model.py)
+# --------------------------------------------------------------------------- #
+def predict_dataset(model: tf.keras.Model, ds: tf.data.Dataset, tta: bool = False) -> np.ndarray:
+    if not tta:
+        return model.predict(ds, verbose=0)
+    outputs = []
+    for images, _ in ds:
+        batch = images.numpy()
+        variants = dihedral_variants(batch)
+        probs = model.predict(np.concatenate(variants, axis=0), verbose=0)
+        outputs.append(probs.reshape(len(variants), len(batch), -1).mean(axis=0))
+    return np.concatenate(outputs, axis=0)
 
-    predictions = np.argmax(model.predict(X_val, batch_size=BATCH_SIZE, verbose=0), axis=1)
-    confusion = np.zeros((len(CLASSES), len(CLASSES)), dtype=np.int32)
-    for actual, predicted in zip(y_val, predictions):
-        confusion[actual, predicted] += 1
-    print("\n📋 Confusion matrix (rows=actual, columns=predicted):")
-    print("   " + " ".join(f"{name[:8]:>8}" for name in CLASSES))
-    for name, row in zip(CLASSES, confusion):
-        print(f"{name[:8]:>8} " + " ".join(f"{value:8d}" for value in row))
 
-    print(f"💾 Best model already saved to '{MODEL_PATH}'")
+def evaluate_split(model: tf.keras.Model, ds: tf.data.Dataset, labels: np.ndarray, tta: bool = False, threshold: float = DEFAULT_THRESHOLD) -> dict:
+    probs = predict_dataset(model, ds, tta=tta)
+    preds = probs.argmax(axis=1)
+    report = classification_report(labels, preds, labels=list(range(len(CLASSES))), target_names=CLASSES, output_dict=True, zero_division=0)
+    cm = confusion_matrix(labels, preds, labels=list(range(len(CLASSES))))
 
-    print("\n🧪 Real-dataset validation check:")
-    for cls in CLASSES:
-        img, true_cls = get_real_dataset_sample(class_name=cls)
-        pred = model.predict(preprocess_for_model(img), verbose=0)
-        guess = CLASSES[int(np.argmax(pred))]
-        status = "✅" if guess == true_cls else "❌"
-        print(f"   True: {true_cls:<7} → Predicted: {guess} {status}")
+    # Defect-vs-good uses the same rule as the app: flag when 1 - P(Good) >= threshold.
+    defect_score = 1.0 - probs[:, GOOD_INDEX]
+    is_defect_true = labels != GOOD_INDEX
+    is_defect_pred = defect_score >= threshold
+    tp = int(np.sum(is_defect_true & is_defect_pred))
+    fn = int(np.sum(is_defect_true & ~is_defect_pred))
+    fp = int(np.sum(~is_defect_true & is_defect_pred))
+    auc = float(roc_auc_score(is_defect_true, defect_score)) if 0 < is_defect_true.sum() < len(labels) else float("nan")
+    return {
+        "n_samples": int(len(labels)),
+        "accuracy": float((preds == labels).mean()),
+        "macro_f1": float(f1_score(labels, preds, average="macro", zero_division=0)),
+        "per_class": {cls: report[cls] for cls in CLASSES},
+        "confusion_matrix": cm.tolist(),
+        "defect_detection": {
+            "threshold": threshold,
+            "recall": tp / max(tp + fn, 1),
+            "precision": tp / max(tp + fp, 1),
+            "false_alarm_rate": fp / max(int(np.sum(~is_defect_true)), 1),
+            "roc_auc": auc,
+            "missed_defects": fn,
+            "false_alarms": fp,
+        },
+    }
+
+
+def format_confusion(cm) -> str:
+    width = max(8, max(len(c) for c in CLASSES))
+    header = " " * width + " " + " ".join(f"{c[:width]:>{width}}" for c in CLASSES)
+    rows = [f"{name[:width]:>{width}} " + " ".join(f"{v:{width}d}" for v in row) for name, row in zip(CLASSES, cm)]
+    return "\n".join([header, *rows])
+
+
+def print_metrics(title: str, metrics: dict) -> None:
+    print(f"\n📊 {title}: accuracy {metrics['accuracy']:.1%}, macro-F1 {metrics['macro_f1']:.3f} (n={metrics['n_samples']})")
+    print(f"{'class':<14}{'precision':>10}{'recall':>10}{'f1':>10}{'support':>10}")
+    for cls, m in metrics["per_class"].items():
+        print(f"{cls:<14}{m['precision']:>10.3f}{m['recall']:>10.3f}{m['f1-score']:>10.3f}{int(m['support']):>10d}")
+    dd = metrics["defect_detection"]
+    print(
+        f"Defect vs Good @ sensitivity {dd['threshold']:.2f} — recall {dd['recall']:.1%}, precision {dd['precision']:.1%}, "
+        f"false-alarm rate {dd['false_alarm_rate']:.1%}, ROC-AUC {dd['roc_auc']:.3f} (missed {dd['missed_defects']}, false alarms {dd['false_alarms']})"
+    )
+    print("Confusion matrix (rows=actual, cols=predicted):")
+    print(format_confusion(metrics["confusion_matrix"]))
+
+
+def history_to_dict(*histories) -> dict[str, list[float]]:
+    merged: dict[str, list[float]] = {}
+    for h in histories:
+        if h is None:
+            continue
+        for k, v in h.history.items():
+            merged.setdefault(k, []).extend(float(x) for x in v)
+    return merged
+
+
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    args = parse_args()
+    if args.threads > 0:
+        tf.config.threading.set_intra_op_parallelism_threads(args.threads)
+        tf.config.threading.set_inter_op_parallelism_threads(args.threads)
+    tf.keras.utils.set_random_seed(args.seed)
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+
+    index = index_dataset(args.data_dir, max_per_class=args.max_per_class, seed=args.seed)
+    splits = grouped_split(index, args.val_fraction, args.test_fraction, args.seed)
+    train_idx, val_idx, test_idx = (index.subset(splits[k]) for k in ("train", "val", "test"))
+    print(f"✅ {len(index)} images from {len(set(index.groups))} source images")
+    for name, sub in (("train", train_idx), ("val", val_idx), ("test", test_idx)):
+        print(f"   {name:<5} {len(sub):>6} images, {len(set(sub.groups)):>4} sources, {sub.class_counts()}")
+
+    with open(os.path.join(ARTIFACTS_DIR, "split_manifest.json"), "w") as f:
+        json.dump(
+            {
+                "seed": args.seed,
+                "max_per_class": args.max_per_class,
+                "classes": CLASSES,
+                **{k: {"paths": sub.paths, "labels": sub.labels.tolist()} for k, sub in (("train", train_idx), ("val", val_idx), ("test", test_idx))},
+            },
+            f,
+        )
+
+    train_ds = make_dataset(train_idx, args.img_size, args.batch_size, training=True, seed=args.seed)
+    val_ds = make_dataset(val_idx, args.img_size, args.batch_size, training=False, seed=args.seed)
+    test_ds = make_dataset(test_idx, args.img_size, args.batch_size, training=False, seed=args.seed)
+    class_weights = balanced_class_weights(train_idx.labels)
+    print("   class weights:", {CLASSES[i]: round(w, 2) for i, w in class_weights.items()})
+
+    model, backbone = build_model(args.img_size, args.seed)
+    compile_model(model, args.learning_rate)
+    model.summary()
+
+    started = time.time()
+    print("\n🚀 Phase 1 — training classifier head (backbone frozen)")
+    hist1 = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, class_weight=class_weights, callbacks=callbacks_for(args.model_path, patience=4))
+
+    hist2 = None
+    if args.fine_tune_epochs > 0:
+        n = unfreeze_top(backbone, args.fine_tune_from)
+        compile_model(model, args.fine_tune_learning_rate)
+        best_val_loss = float(min(hist1.history["val_loss"]))
+        print(f"\n🔧 Phase 2 — fine-tuning {n} backbone layers from '{args.fine_tune_from}' (checkpoint only if val_loss < {best_val_loss:.4f})")
+        hist2 = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=args.fine_tune_epochs,
+            class_weight=class_weights,
+            callbacks=callbacks_for(args.model_path, patience=3, best_so_far=best_val_loss),
+        )
+    print(f"\n⏱️  Training took {(time.time() - started) / 60:.1f} min")
+
+    model = tf.keras.models.load_model(args.model_path, compile=False)
+    model.save(args.model_path, include_optimizer=False)
+    val_metrics = evaluate_split(model, val_ds, val_idx.labels)
+    test_metrics = evaluate_split(model, test_ds, test_idx.labels)
+    print_metrics("Validation", val_metrics)
+    print_metrics("Held-out test (unseen source images)", test_metrics)
+
+    with open(os.path.join(ARTIFACTS_DIR, "metrics.json"), "w") as f:
+        json.dump({"validation": val_metrics, "test": test_metrics, "args": vars(args)}, f, indent=2)
+    with open(os.path.join(ARTIFACTS_DIR, "training_history.json"), "w") as f:
+        json.dump(history_to_dict(hist1, hist2), f, indent=2)
+    print(f"\n💾 Model saved to '{args.model_path}', metrics to '{ARTIFACTS_DIR}/'")
 
 
 if __name__ == "__main__":

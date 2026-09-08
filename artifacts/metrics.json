@@ -1,0 +1,184 @@
+{
+  "validation": {
+    "n_samples": 997,
+    "accuracy": 0.8345035105315948,
+    "macro_f1": 0.7377374483627928,
+    "per_class": {
+      "Good": {
+        "precision": 0.8575498575498576,
+        "recall": 0.9647435897435898,
+        "f1-score": 0.9079939668174962,
+        "support": 624.0
+      },
+      "Hole": {
+        "precision": 0.8235294117647058,
+        "recall": 0.7567567567567568,
+        "f1-score": 0.7887323943661971,
+        "support": 37.0
+      },
+      "Objects": {
+        "precision": 0.8,
+        "recall": 0.6301369863013698,
+        "f1-score": 0.7049808429118773,
+        "support": 146.0
+      },
+      "Oil Spot": {
+        "precision": 0.6166666666666667,
+        "recall": 0.38144329896907214,
+        "f1-score": 0.4713375796178344,
+        "support": 97.0
+      },
+      "Thread Error": {
+        "precision": 0.8488372093023255,
+        "recall": 0.7849462365591398,
+        "f1-score": 0.8156424581005587,
+        "support": 93.0
+      }
+    },
+    "confusion_matrix": [
+      [
+        602,
+        0,
+        11,
+        7,
+        4
+      ],
+      [
+        2,
+        28,
+        2,
+        0,
+        5
+      ],
+      [
+        38,
+        4,
+        92,
+        12,
+        0
+      ],
+      [
+        50,
+        0,
+        6,
+        37,
+        4
+      ],
+      [
+        10,
+        2,
+        4,
+        4,
+        73
+      ]
+    ],
+    "defect_detection": {
+      "threshold": 0.5,
+      "recall": 0.839142091152815,
+      "precision": 0.855191256830601,
+      "false_alarm_rate": 0.08493589743589744,
+      "roc_auc": 0.9473001306111226,
+      "missed_defects": 60,
+      "false_alarms": 53
+    }
+  },
+  "test": {
+    "n_samples": 964,
+    "accuracy": 0.7842323651452282,
+    "macro_f1": 0.6603595087333998,
+    "per_class": {
+      "Good": {
+        "precision": 0.8208744710860366,
+        "recall": 0.9635761589403974,
+        "f1-score": 0.8865194211728865,
+        "support": 604.0
+      },
+      "Hole": {
+        "precision": 0.896551724137931,
+        "recall": 0.6190476190476191,
+        "f1-score": 0.7323943661971831,
+        "support": 42.0
+      },
+      "Objects": {
+        "precision": 0.6090909090909091,
+        "recall": 0.47183098591549294,
+        "f1-score": 0.5317460317460317,
+        "support": 142.0
+      },
+      "Oil Spot": {
+        "precision": 0.6666666666666666,
+        "recall": 0.3185840707964602,
+        "f1-score": 0.4311377245508982,
+        "support": 113.0
+      },
+      "Thread Error": {
+        "precision": 0.7258064516129032,
+        "recall": 0.7142857142857143,
+        "f1-score": 0.72,
+        "support": 63.0
+      }
+    },
+    "confusion_matrix": [
+      [
+        582,
+        0,
+        13,
+        4,
+        5
+      ],
+      [
+        0,
+        26,
+        6,
+        0,
+        10
+      ],
+      [
+        61,
+        0,
+        67,
+        12,
+        2
+      ],
+      [
+        59,
+        0,
+        18,
+        36,
+        0
+      ],
+      [
+        7,
+        3,
+        6,
+        2,
+        45
+      ]
+    ],
+    "defect_detection": {
+      "threshold": 0.5,
+      "recall": 0.7694444444444445,
+      "precision": 0.8393939393939394,
+      "false_alarm_rate": 0.08774834437086093,
+      "roc_auc": 0.9153375643855776,
+      "missed_defects": 83,
+      "false_alarms": 53
+    }
+  },
+  "args": {
+    "data_dir": "dataset",
+    "model_path": "fabric_model.keras",
+    "img_size": 128,
+    "batch_size": 32,
+    "epochs": 12,
+    "fine_tune_epochs": 10,
+    "fine_tune_from": "block_6_expand",
+    "learning_rate": 0.001,
+    "fine_tune_learning_rate": 0.0001,
+    "max_per_class": 4000,
+    "val_fraction": 0.15,
+    "test_fraction": 0.15,
+    "seed": 42,
+    "threads": 0
+  }
+}

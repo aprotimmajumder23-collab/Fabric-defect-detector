@@ -1,5 +1,7 @@
-tensorflow
-opencv-python-headless
-numpy
-streamlit
-pillow
+tensorflow-cpu==2.19.0
+keras==3.12.4
+opencv-python-headless>=4.10,<5.1
+numpy>=1.26,<2.3
+scikit-learn>=1.5,<1.8
+pandas>=2.1,<2.4
+streamlit>=1.39,<2.0
